@@ -78,24 +78,41 @@ class HpglParser:
         return coords
 
     def _name_size(self, lbl: str) -> Tuple[str, str]:
-        """Extract (size, piece_name) from a plotter label such as
-        '42 PID COUL 9MIJA 4555 A' -> ('42', 'PID COUL') or
-        'S DOV 9MIJA A' -> ('S', 'DOV'). Size is the leading token; the name is
-        the descriptive words before the model code (a token with digits or
-        'MIJA'). Keeps multi-word names; drops the marker index letter."""
+        """Extract (size, piece_name) from a plotter label. Two conventions
+        are seen in the wild:
+          '42 PID COUL 9MIJA 4555 A'  -> size LEADS  -> ('42', 'PID COUL')
+          'S DOV 9MIJA A'             -> size LEADS  -> ('S', 'DOV')
+          'GARNITEUR 9AMIJA 4555 44'  -> size TRAILS -> ('44', 'GARNITEUR')
+        A token is size-like if it's 1-3 digits or S/M/L/X letters. A token is
+        part of the model code (not the name) if it has a digit or contains
+        'MIJA'. The name is the descriptive words before the model code."""
         toks = lbl.split()
         if not toks:
             return ('', lbl)
+
+        def is_size_tok(t):
+            return bool(re.fullmatch(r'\d{1,3}', t)) or \
+                   bool(re.fullmatch(r'[SMLX]{1,4}', t, re.IGNORECASE))
+
+        def is_code_tok(t):
+            return bool(re.search(r'\d', t)) or 'MIJA' in t.upper()
+
         size = ''
-        if re.fullmatch(r'\d{1,3}|[SMLX]{1,4}', toks[0]):
+        body = toks
+        if len(toks) >= 2 and is_size_tok(toks[-1]) and \
+                any(is_code_tok(t) for t in toks[:-1]):
+            size = toks[-1]
+            body = toks[:-1]
+        elif is_size_tok(toks[0]):
             size = toks[0]
-            toks = toks[1:]
+            body = toks[1:]
+
         name_toks = []
-        for t in toks:
-            if re.search(r'\d', t) or 'MIJA' in t.upper():
+        for t in body:
+            if is_code_tok(t):
                 break
             name_toks.append(t)
-        name = ' '.join(name_toks) if name_toks else (toks[0] if toks else lbl)
+        name = ' '.join(name_toks) if name_toks else (body[0] if body else lbl)
         return (size, name.strip())
 
     def label_to_tuple(self, s: str) -> Tuple[str, str, str]:
@@ -1869,7 +1886,7 @@ class handler(BaseHTTPRequestHandler):
 
     def _fail(self, e):
         import traceback
-        msg = ('BERA Converter error:\n\n' + traceback.format_exc()).encode('utf-8')
+        msg = ('BERA Converter error:' + chr(10) + chr(10) + traceback.format_exc()).encode('utf-8')
         try:
             self.send_response(500)
             self._cors()
