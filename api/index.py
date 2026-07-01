@@ -1697,7 +1697,7 @@ function renderPieces(d){
   for(const item of data){
     const tr=document.createElement('tr');tr.className='hover:bg-slate-50/50';
     const pid=item.piece_id||'—';
-    const sz=item.size||(item.size===undefined?'—':item.size);
+    const sz=(item.size!==undefined&&item.size!==null&&item.size!=='')?item.size:'—';
     const pts=item.outer?item.outer.length:(item.polygon?item.polygon.length:0);
     const area=item.area_mm2!==undefined?item.area_mm2.toFixed(1):(item.polygon?polyArea(item.polygon)*0.0254*0.0254:0).toFixed(1);
     const nch=item.notch_count!==undefined?item.notch_count:0;
