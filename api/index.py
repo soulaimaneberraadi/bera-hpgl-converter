@@ -1,5 +1,6 @@
 """BERA Converter - single-file Vercel serverless function (self-contained)."""
 import http.server, urllib.parse, os, io, json, re, math, struct
+from http.server import BaseHTTPRequestHandler
 from typing import List, Tuple, Dict, Optional
 from collections import defaultdict
 
@@ -1864,10 +1865,23 @@ def parse_multipart(body, boundary):
     return fields, files
 
 
-class handler(http.server.BaseHTTPRequestHandler):
+class handler(BaseHTTPRequestHandler):
+
+    def _fail(self, e):
+        import traceback
+        msg = ('BERA Converter error:\n\n' + traceback.format_exc()).encode('utf-8')
+        try:
+            self.send_response(500)
+            self._cors()
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+        except Exception:
+            pass
 
     def do_GET(self):
-        if urllib.parse.urlparse(self.path).path == '/':
+        try:
             b = TEMPLATE.encode('utf-8')
             self.send_response(200)
             self._cors()
@@ -1875,9 +1889,8 @@ class handler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(b)))
             self.end_headers()
             self.wfile.write(b)
-            return
-        self.send_response(404)
-        self.end_headers()
+        except Exception as e:
+            self._fail(e)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1885,21 +1898,21 @@ class handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        ct = self.headers.get('Content-Type', '')
-        cl = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(cl)
-        p = urllib.parse.urlparse(self.path).path
-        if p == '/upload':
-            self._upload(body, ct)
-        elif p == '/upload-batch':
-            self._upload_batch(body, ct)
-        elif p == '/compare':
-            self._compare(body, ct)
-        elif p == '/convert':
-            self._convert(body, ct)
-        else:
-            self.send_response(404)
-            self.end_headers()
+        try:
+            ct = self.headers.get('Content-Type', '')
+            cl = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(cl)
+            p = urllib.parse.urlparse(self.path).path
+            if 'upload-batch' in p:
+                self._upload_batch(body, ct)
+            elif 'compare' in p:
+                self._compare(body, ct)
+            elif 'convert' in p:
+                self._convert(body, ct)
+            else:
+                self._upload(body, ct)
+        except Exception as e:
+            self._fail(e)
 
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
