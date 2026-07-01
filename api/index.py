@@ -1,22 +1,693 @@
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+"""BERA Converter - single-file Vercel serverless function (self-contained)."""
+import http.server, urllib.parse, os, io, json, re, math, struct
+from typing import List, Tuple, Dict, Optional
+from collections import defaultdict
+
+
+"""HPGL/PLT plotter file parser - extracts piece geometries as clean polygons with labels."""
+
+
+
+class HpglParser:
+    """Parse HPGL/PLT plotter files and extract piece geometries."""
+
+    def __init__(self, path: Optional[str] = None, content: str = None):
+        self.path = path
+        if content is not None:
+            self.content = content
+        elif path:
+            with open(path, 'r', encoding='latin-1') as f:
+                self.content = f.read()
+        else:
+            self.content = ''
+        self.commands = []
+        self.pieces = []
+        self.labels = []   # [(x, y, size, name, full)] — label with its position
+        self.info = {}
+
+    def tokenize(self):
+        raw = self.content
+        cmds = []
+        i = 0
+        while i < len(raw):
+            m = re.match(r'([A-Z]{2})', raw[i:])
+            if not m:
+                i += 1
+                continue
+            cmd = m.group(1)
+            i += m.end()
+            if cmd == 'LB':
+                end = raw.find('\x03', i)
+                if end < 0:
+                    args = raw[i:]
+                    i = len(raw)
+                else:
+                    args = raw[i:end]
+                    i = end + 1
+                cmds.append((cmd, args.strip()))
+                continue
+            args = ''
+            while i < len(raw):
+                ch = raw[i]
+                if ch == ';':
+                    i += 1
+                    break
+                if ch == '\x03':
+                    break
+                if re.match(r'[A-Z]{2}', raw[i:]):
+                    break
+                args += ch
+                i += 1
+            cmds.append((cmd, args.strip().lstrip(',')))
+        self.commands = cmds
+        return cmds
+
+    def parse_coords(self, s: str) -> List[Tuple[int, int]]:
+        if not s:
+            return []
+        parts = re.split(r'[, ]+', s.strip())
+        coords = []
+        for i in range(0, len(parts) - 1, 2):
+            try:
+                x = int(parts[i])
+                y = int(parts[i+1])
+                coords.append((x, y))
+            except (ValueError, IndexError):
+                pass
+        return coords
+
+    def _name_size(self, lbl: str) -> Tuple[str, str]:
+        """Extract (size, piece_name) from a plotter label such as
+        '42 PID COUL 9MIJA 4555 A' -> ('42', 'PID COUL') or
+        'S DOV 9MIJA A' -> ('S', 'DOV'). Size is the leading token; the name is
+        the descriptive words before the model code (a token with digits or
+        'MIJA'). Keeps multi-word names; drops the marker index letter."""
+        toks = lbl.split()
+        if not toks:
+            return ('', lbl)
+        size = ''
+        if re.fullmatch(r'\d{1,3}|[SMLX]{1,4}', toks[0]):
+            size = toks[0]
+            toks = toks[1:]
+        name_toks = []
+        for t in toks:
+            if re.search(r'\d', t) or 'MIJA' in t.upper():
+                break
+            name_toks.append(t)
+        name = ' '.join(name_toks) if name_toks else (toks[0] if toks else lbl)
+        return (size, name.strip())
+
+    def label_to_tuple(self, s: str) -> Tuple[str, str, str]:
+        s = s.strip()
+        if not s:
+            return ('', '', '')
+        m = re.match(r'(\d+)\s+([A-Za-z]+)', s)
+        if m:
+            return (m.group(1), m.group(2), s)
+        return ('', s, s)
+
+    def parse(self):
+        self.tokenize()
+        pieces = []
+        current_label = ''
+        current_size = ''
+        current_poly = []
+        pen_down = False
+        pos = (0, 0)
+        pending_label = ''
+
+        for cmd, args in self.commands:
+            if cmd == 'IN':
+                pass
+            elif cmd in ('IP', 'SC'):
+                parts = args.split(',')
+                parts = [p for p in parts if p.strip()]
+                if len(parts) >= 4:
+                    try:
+                        self.info[cmd.lower()] = tuple(int(p) for p in parts[:4])
+                    except ValueError:
+                        pass
+            elif cmd in ('SP', 'VS', 'CS', 'SS', 'LT', 'DI', 'SI', 'LO'):
+                pass
+            elif cmd == 'PU':
+                coords = self.parse_coords(args)
+                if coords:
+                    pos = coords[-1]
+                pen_down = False
+                if current_poly:
+                    pieces.append({
+                        'label': pending_label or current_label,
+                        'polygon': current_poly,
+                    })
+                    current_poly = []
+                    pending_label = ''
+            elif cmd == 'PD':
+                coords = self.parse_coords(args)
+                if coords:
+                    if not current_poly:
+                        current_poly.append(pos)
+                    current_poly.extend(coords)
+                    pos = coords[-1]
+                elif not current_poly:
+                    current_poly.append(pos)
+                pen_down = True
+            elif cmd == 'PA':
+                coords = self.parse_coords(args)
+                if coords:
+                    if pen_down or current_poly:
+                        if not current_poly:
+                            current_poly.append(pos)
+                        current_poly.extend(coords)
+                    pos = coords[-1]
+            elif cmd == 'LB':
+                current_label = args.strip()
+                if current_label and 'MODELE' not in current_label.upper() \
+                        and 'LA=' not in current_label and 'LO=' not in current_label:
+                    _sz, _nm = self._name_size(current_label)
+                    self.labels.append((pos[0], pos[1], _sz, _nm, current_label))
+                t = self.label_to_tuple(current_label)
+                pending_label = t[2]
+                if current_poly:
+                    pieces.append({
+                        'label': pending_label,
+                        'polygon': current_poly,
+                    })
+                    current_poly = []
+                    pending_label = ''
+
+        if current_poly:
+            pieces.append({
+                'label': pending_label or current_label,
+                'polygon': current_poly,
+            })
+
+        # Filter and organize pieces
+        filtered = []
+        for p in pieces:
+            poly = p['polygon']
+            if len(poly) < 3:
+                continue
+            lbl = p['label']
+            if 'MODELE' in lbl.upper() or 'LA=' in lbl or 'LO=' in lbl:
+                continue
+            size, pid = self._name_size(lbl)
+
+            if len(poly) <= 5:
+                continue
+
+            filtered.append({
+                'label': lbl, 'piece_id': pid, 'size': size,
+                'polygon': poly,
+            })
+
+        self.pieces = filtered
+        return filtered
+
+    def get_piece_ids(self) -> List[str]:
+        ids = set()
+        for p in self.pieces:
+            if p['piece_id']:
+                ids.add(p['piece_id'])
+        return sorted(ids)
+
+    def get_pieces_by_id(self, pid: str) -> List[dict]:
+        return [p for p in self.pieces if p['piece_id'] == pid]
+
+    def mils_to(self, v, unit='mm'):
+        if unit == 'mm':
+            return v * 0.0254
+        elif unit == 'cm':
+            return v * 0.00254
+        elif unit == 'inch':
+            return v * 0.001
+        return float(v)
+
+    def piece_to_dxf(self, piece: dict, unit: str = 'mm') -> str:
+        poly = piece['polygon']
+        if not poly:
+            return ''
+        pts = [(self.mils_to(x, unit), self.mils_to(y, unit)) for x, y in poly]
+        dxf = '0\nSECTION\n2\nENTITIES\n'
+        dxf += f'0\nLWPOLYLINE\n8\n{piece["piece_id"]}\n62\n1\n100\nAcDbPolyline\n90\n{len(pts)}\n70\n1\n'
+        for x, y in pts:
+            dxf += f'10\n{x:.6f}\n20\n{y:.6f}\n'
+        dxf += '0\nENDSEC\n0\nEOF'
+        return dxf
+
+    def all_to_dxf(self, unit='mm') -> str:
+        dxf = '0\nSECTION\n2\nENTITIES\n'
+        for p in self.pieces:
+            poly = p['polygon']
+            if len(poly) < 3:
+                continue
+            pts = [(self.mils_to(x, unit), self.mils_to(y, unit)) for x, y in poly]
+            dxf += f'0\nLWPOLYLINE\n8\n{p["piece_id"]}\n62\n1\n100\nAcDbPolyline\n90\n{len(pts)}\n70\n1\n'
+            for x, y in pts:
+                dxf += f'10\n{x:.6f}\n20\n{y:.6f}\n'
+        dxf += '0\nENDSEC\n0\nEOF'
+        return dxf
+
+    def pieces_to_svg(self, width=1200, height=900) -> str:
+        if not self.pieces:
+            return '<svg/>'
+        all_pts = [pt for p in self.pieces for pt in p['polygon']]
+        xs = [p[0] for p in all_pts] or [0, 100]
+        ys = [p[1] for p in all_pts] or [0, 100]
+        mnx, mxx = min(xs), max(xs)
+        mny, mxy = min(ys), max(ys)
+        cx = (mnx + mxx) / 2
+        cy = (mny + mxy) / 2
+        rx = (mxx - mnx) or 1
+        ry = (mxy - mny) or 1
+        sc = min(width / rx, height / ry) * 0.85
+
+        def tr(x, y):
+            return ((x - cx) * sc + width/2, (y - cy) * sc + height/2)
+
+        colors = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#1abc9c']
+        paths = []
+        for p in self.pieces:
+            poly = p['polygon']
+            if len(poly) < 2:
+                continue
+            pid = p['piece_id']
+            ci = abs(hash(pid)) % len(colors)
+            col = colors[ci]
+            sx, sy = tr(poly[0][0], poly[0][1])
+            d = f'M {sx:.2f} {sy:.2f}'
+            for pt in poly[1:]:
+                px, py = tr(pt[0], pt[1])
+                d += f' L {px:.2f} {py:.2f}'
+            d += ' Z'
+            paths.append((d, col, pid, poly[0]))
+
+        layers = ''
+        for d, c, pid, origin in paths:
+            layers += f'  <path d="{d}" fill="{c}" fill-opacity="0.25" stroke="{c}" stroke-width="1.5" />\n'
+            ox, oy = tr(origin[0], origin[1])
+            layers += f'  <text x="{ox}" y="{oy}" fill="{c}" font-size="9" font-family="monospace">{pid}</text>\n'
+
+        stats = ''
+        if 'ip' in self.info: stats += f'IP={self.info["ip"]} | '
+        stats += f'Pieces: {len(self.pieces)}'
+        hdr = f'<text x="10" y="20" font-family="monospace" font-size="12">{os.path.basename(self.path or "?")} | {stats}</text>\n'
+
+        return f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">\n{hdr}{layers}</svg>'
+
+"""Group HPGL sub-polygons into piece ensembles — outer contours + internal features."""
+
+
+
+Point = Tuple[float, float]
+
+
+def area(poly: List[Point]) -> float:
+    """Shoelace formula, returns area in mils²."""
+    n = len(poly)
+    if n < 3:
+        return 0.0
+    s = 0.0
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def centroid(poly: List[Point]) -> Point:
+    cx = sum(p[0] for p in poly) / len(poly)
+    cy = sum(p[1] for p in poly) / len(poly)
+    return cx, cy
+
+
+def point_segment_distance(px: float, py: float,
+                           ax: float, ay: float,
+                           bx: float, by: float) -> float:
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    nx, ny = ax + t * dx, ay + t * dy
+    return math.hypot(px - nx, py - ny)
+
+
+def poly_bbox(poly: List[Point]) -> Tuple[float, float, float, float]:
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def point_in_polygon(px: float, py: float, poly: List[Point]) -> bool:
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if ((y1 > py) != (y2 > py)) and \
+           px < (x2 - x1) * (py - y1) / (y2 - y1) + x1:
+            inside = not inside
+    return inside
+
+
+def point_on_edge(px: float, py: float, poly: List[Point],
+                  tol: float = 50.0) -> bool:
+    n = len(poly)
+    for i in range(n):
+        d = point_segment_distance(px, py,
+                                   poly[i][0], poly[i][1],
+                                   poly[(i + 1) % n][0],
+                                   poly[(i + 1) % n][1])
+        if d < tol:
+            return True
+    return False
+
+
+def polygon_centroid_distance(poly: List[Point],
+                              other: List[Point]) -> float:
+    cx1, cy1 = centroid(poly)
+    cx2, cy2 = centroid(other)
+    return math.hypot(cx1 - cx2, cy1 - cy2)
+
+
+def classify_feature(poly: List[Point], outer: List[Point]) -> str:
+    a = area(poly)
+    cx, cy = centroid(poly)
+    inside = point_in_polygon(cx, cy, outer)
+    on_edge = point_on_edge(cx, cy, outer)
+
+    if a < 500 and on_edge:
+        return 'notch'
+    if a < 500:
+        return 'notch'
+
+    bbox = poly_bbox(poly)
+    bw = bbox[2] - bbox[0]
+    bh = bbox[3] - bbox[1]
+    aspect = max(bw, bh) / (min(bw, bh) + 1e-6)
+
+    if aspect > 5 and a < 20000:
+        outer_bbox = poly_bbox(outer)
+        ocx = (outer_bbox[0] + outer_bbox[2]) / 2.0
+        ocy = (outer_bbox[1] + outer_bbox[3]) / 2.0
+        outer_diag = math.hypot(outer_bbox[2] - outer_bbox[0],
+                                outer_bbox[3] - outer_bbox[1])
+        if math.hypot(cx - ocx, cy - ocy) < outer_diag * 0.3:
+            return 'grain_line'
+
+    if a < 3000 and aspect < 1.5 and inside:
+        return 'buttonhole'
+    if a < 10000 and inside and len(poly) <= 6:
+        return 'dart'
+    if inside:
+        return 'internal'
+
+    return 'unknown'
+
+
+def is_contained(inner: List[Point], outer: List[Point]) -> bool:
+    """A polygon is internal to `outer` only if most of its vertices lie inside
+    it. Separate pieces in a marker never overlap, so this cleanly separates
+    real internal features (notches/darts/grain lines) from distinct pieces."""
+    if len(inner) < 2:
+        return False
+    inside = sum(1 for x, y in inner if point_in_polygon(x, y, outer))
+    return inside >= len(inner) * 0.5
+
+
+def extract_notches(poly: List[Point], ret_eps: float = 45.0,
+                    tick_max: float = 380.0, dedup: float = 60.0):
+    """Separate notches (crans) from the boundary path.
+
+    In plotter output a notch is drawn as a short out-and-back excursion in the
+    contour (go out to a tip, return to the same point). Those spikes make CAD
+    importers fail with 'zero-length segment'. This removes them from the
+    boundary and returns their base positions so they can be re-emitted as
+    proper notch marks on ASTM layer 4.
+
+    Returns (clean_boundary, [notch_point, ...]).
+    """
+    pts = list(poly)
+    notches: List[Point] = []
+    guard = 0
+    while len(pts) > 4 and guard < 20000:
+        guard += 1
+        removed = False
+        n = len(pts)
+        for i in range(1, n - 1):
+            a, b, d = pts[i - 1], pts[i], pts[i + 1]
+            back = math.hypot(a[0] - d[0], a[1] - d[1])   # returns to start?
+            tick = math.hypot(a[0] - b[0], a[1] - b[1])   # short excursion?
+            if back < ret_eps and 1.0 < tick < tick_max:
+                notches.append(a)
+                del pts[i:i + 2]      # drop tip + return, keep base
+                removed = True
+                break
+        if not removed:
+            break
+    uniq: List[Point] = []
+    for nx, ny in notches:
+        if all(math.hypot(nx - ux, ny - uy) > dedup for ux, uy in uniq):
+            uniq.append((nx, ny))
+    return pts, uniq
+
+
+def label_inside(poly: List[Point], labels) -> Optional[tuple]:
+    """Pick the plotter label whose text position falls inside this piece.
+    Plotter labels are placed geometrically inside their piece, not in draw
+    order, so sequence-based association is wrong — this fixes the piece
+    name/size by containment. Returns (x, y, size, name, full) or None."""
+    if not labels:
+        return None
+    cx, cy = centroid(poly)
+    best, bestd = None, float('inf')
+    for lab in labels:
+        lx, ly = lab[0], lab[1]
+        if point_in_polygon(lx, ly, poly):
+            d = math.hypot(lx - cx, ly - cy)
+            if d < bestd:
+                bestd, best = d, lab
+    return best
+
+
+def group_pieces(parser: HpglParser) -> List[dict]:
+    """Group polygons into piece ensembles by GEOMETRIC CONTAINMENT, not by
+    label. Each non-contained polygon is its own piece (boundary on AAMA layer
+    1); only polygons truly nested inside become internal features. Notches are
+    extracted off the boundary onto their own list (ASTM layer 4). Piece
+    name/size are assigned by GEOMETRIC label containment. This keeps every
+    distinct piece a separate cuttable piece for Gerber AccuMark / PDS."""
+    parser.parse()
+    polys = [p for p in parser.pieces if area(p['polygon']) >= 1]
+    polys.sort(key=lambda x: area(x['polygon']), reverse=True)
+    n = len(polys)
+    used = [False] * n
+
+    ensembles = []
+    for i in range(n):
+        if used[i]:
+            continue
+        used[i] = True
+        host = polys[i]
+        outer_raw = host['polygon']
+        outer_poly, notches = extract_notches(outer_raw)
+        # geometric label association (correct name/size for this piece)
+        lab = label_inside(outer_raw, getattr(parser, 'labels', None))
+        pid = lab[3] if lab else host['piece_id']
+        sz = lab[2] if lab else host.get('size', '')
+        internals = []
+        for j in range(i + 1, n):
+            if used[j]:
+                continue
+            if is_contained(polys[j]['polygon'], outer_raw):
+                used[j] = True
+                internals.append({
+                    'polygon': polys[j]['polygon'],
+                    'type': classify_feature(polys[j]['polygon'], outer_raw),
+                })
+        ensembles.append({
+            'piece_id': pid,
+            'size': sz,
+            'outer': outer_poly,
+            'notches': notches,
+            'internals': internals,
+            'area_mm2': area(outer_poly) * 0.0254 * 0.0254,
+        })
+    return ensembles
+
+
+def ensemble_to_dxf(ensemble: dict, unit: str = 'mm') -> str:
+    scale = 0.0254 if unit == 'mm' else 0.00254 if unit == 'cm' else 0.001 if unit == 'inch' else 1.0
+
+    def scale_pts(pts):
+        return [(x * scale, y * scale) for x, y in pts]
+
+    dxf = '0\nSECTION\n2\nENTITIES\n'
+    outer = scale_pts(ensemble['outer'])
+    dxf += f'0\nLWPOLYLINE\n8\nOUTER\n62\n1\n100\nAcDbPolyline\n90\n{len(outer)}\n70\n1\n'
+    for x, y in outer:
+        dxf += f'10\n{x:.6f}\n20\n{y:.6f}\n'
+    for feat in ensemble['internals']:
+        poly = scale_pts(feat['polygon'])
+        layer = f'INTERNAL_{feat["type"].upper()}'
+        dxf += f'0\nLWPOLYLINE\n8\n{layer}\n62\n3\n100\nAcDbPolyline\n90\n{len(poly)}\n70\n1\n'
+        for x, y in poly:
+            dxf += f'10\n{x:.6f}\n20\n{y:.6f}\n'
+    dxf += '0\nENDSEC\n0\nEOF'
+    return dxf
+
+"""Reconstruct gradation from a multi-size plotter marker.
+
+A flat PLT marker draws each piece at every size, at arbitrary position /
+rotation / mirror. To recover the grade we must, per piece name:
+  1. pick one clean shape per size,
+  2. align the larger sizes onto the base size (Procrustes: mirror + rotation +
+     point-offset over an arc-length resample),
+  3. keep the aligned, nested boundaries — their point-wise difference IS the
+     grade.
+
+The aligned boundaries (all sharing point count and a common reference centre)
+are emitted nested in one ASTM block so Gerber reads the piece as graded.
+"""
+
+
+
+def resample(poly, n=96):
+    """Resample a closed polygon to n points equally spaced by arc length."""
+    if len(poly) < 3:
+        return list(poly)
+    pts = list(poly) + [poly[0]]
+    seg = [0.0]
+    for i in range(1, len(pts)):
+        seg.append(seg[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                        pts[i][1] - pts[i - 1][1]))
+    total = seg[-1] or 1.0
+    out = []
+    j = 1
+    for k in range(n):
+        d = total * k / n
+        while j < len(seg) and seg[j] < d:
+            j += 1
+        jj = min(j, len(pts) - 1)
+        span = (seg[jj] - seg[jj - 1]) or 1.0
+        t = (d - seg[jj - 1]) / span
+        out.append((pts[jj - 1][0] + t * (pts[jj][0] - pts[jj - 1][0]),
+                    pts[jj - 1][1] + t * (pts[jj][1] - pts[jj - 1][1])))
+    return out
+
+
+def _centroid(rp):
+    cx = sum(x for x, y in rp) / len(rp)
+    cy = sum(y for x, y in rp) / len(rp)
+    return cx, cy
+
+
+def align_to(src_poly, ref_poly, n=96):
+    """Align src onto ref (both closed polygons). Returns src resampled to n
+    points, mirrored/rotated/offset to best match ref, and re-centred on ref's
+    centroid so the two nest concentrically. Also returns the mean residual mm.
+    """
+    a = resample(ref_poly, n)
+    b = resample(src_poly, n)
+    rcx, rcy = _centroid(a)
+    bcx, bcy = _centroid(b)
+    a0 = [(x - rcx, y - rcy) for x, y in a]
+    b0 = [(x - bcx, y - bcy) for x, y in b]
+
+    best = (float('inf'), None)
+    step = 2
+    for mir in (1, -1):
+        bm = [(x * mir, y) for x, y in b0]
+        for off in range(n):
+            num = den = 0.0
+            for i in range(0, n, step):
+                bx, by = bm[(i + off) % n]
+                ax, ay = a0[i]
+                num += ax * by - ay * bx
+                den += ax * bx + ay * by
+            th = math.atan2(num, den)
+            c, s = math.cos(th), math.sin(th)
+            d = 0.0
+            for i in range(0, n, step):
+                bx, by = bm[(i + off) % n]
+                rx = c * bx + s * by
+                ry = -s * bx + c * by
+                d += (a0[i][0] - rx) ** 2 + (a0[i][1] - ry) ** 2
+            if d < best[0]:
+                best = (d, (off, mir, th))
+
+    off, mir, th = best[1]
+    bm = [(x * mir, y) for x, y in b0]
+    c, s = math.cos(th), math.sin(th)
+    aligned = []
+    resid = 0.0
+    for i in range(n):
+        bx, by = bm[(i + off) % n]
+        rx = c * bx + s * by
+        ry = -s * bx + c * by
+        aligned.append((rx + rcx, ry + rcy))
+        resid += math.hypot(rx - a0[i][0], ry - a0[i][1])
+    return aligned, (resid / n) * 0.0254
+
+
+def build_graded_pieces(ensembles, n=96):
+    """Group ensembles by piece name, pair sizes, align them, and return graded
+    pieces. Only names present at >= 2 sizes are graded; the rest pass through
+    as single-size pieces."""
+    byname = defaultdict(lambda: defaultdict(list))
+    singles = []
+    for e in ensembles:
+        nm = str(e.get('piece_id', '') or '')
+        sz = str(e.get('size', '') or '')
+        if nm and sz:
+            byname[nm][sz].append(e)
+        else:
+            singles.append(e)
+
+    graded = []
+    for nm, bysz in byname.items():
+        sizes = sorted(bysz.keys())
+        if len(sizes) < 2:
+            for e in bysz[sizes[0]]:
+                singles.append(e)
+            continue
+        # one representative (largest area) shape per size
+        reps = {sz: max(lst, key=lambda e: area(e['outer']))
+                for sz, lst in bysz.items()}
+        base_sz = sizes[0]
+        base = reps[base_sz]
+        base_rs = resample(base['outer'], n)
+        boundaries = {base_sz: base_rs}
+        resid = {}
+        for sz in sizes[1:]:
+            al, r = align_to(reps[sz]['outer'], base['outer'], n)
+            boundaries[sz] = al
+            resid[sz] = r
+        graded.append({
+            'name': nm,
+            'sizes': sizes,
+            'base_size': base_sz,
+            'boundaries': boundaries,
+            'notches': base.get('notches', []),
+            'internals': base.get('internals', []),
+            'residual_mm': resid,
+        })
+    return graded, singles
+
+# ---- module aliases expected by the web layer ----
+_group_pieces = group_pieces
+_poly_area = area
+HAS_GROUPER = True
+HAS_GRADATION = True
+
+
 """BERA Converter Web — BERAMETHODE style — Full feature"""
 
-import http.server, urllib.parse, os, io, json, re, math, struct
 
-from hpgl_parser import HpglParser
 
-try:
-    from piece_grouper import group_pieces as _group_pieces, area as _poly_area
-    HAS_GROUPER = True
-except ImportError:
-    HAS_GROUPER = False
 
-try:
-    from gradation import build_graded_pieces
-    HAS_GRADATION = True
-except ImportError:
-    HAS_GRADATION = False
+
+
 
 PORT = 9000
 
@@ -1196,13 +1867,17 @@ def parse_multipart(body, boundary):
 class handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
-        b = TEMPLATE.encode('utf-8')
-        self.send_response(200)
-        self._cors()
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.send_header('Content-Length', str(len(b)))
+        if urllib.parse.urlparse(self.path).path == '/':
+            b = TEMPLATE.encode('utf-8')
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+        self.send_response(404)
         self.end_headers()
-        self.wfile.write(b)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1214,14 +1889,17 @@ class handler(http.server.BaseHTTPRequestHandler):
         cl = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(cl)
         p = urllib.parse.urlparse(self.path).path
-        if 'upload-batch' in p:
+        if p == '/upload':
+            self._upload(body, ct)
+        elif p == '/upload-batch':
             self._upload_batch(body, ct)
-        elif 'compare' in p:
+        elif p == '/compare':
             self._compare(body, ct)
-        elif 'convert' in p:
+        elif p == '/convert':
             self._convert(body, ct)
         else:
-            self._upload(body, ct)
+            self.send_response(404)
+            self.end_headers()
 
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
