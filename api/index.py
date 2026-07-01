@@ -649,6 +649,28 @@ input,select,button,textarea{font-family:inherit}
   </div>
 </div>
 
+<!-- ═══════ Compare two files ═══════ -->
+<div class="bg-white rounded-xl border border-slate-200 shadow-sm">
+  <div onclick="toggleCompare()" class="px-5 h-10 flex items-center justify-between border-b border-slate-100 cursor-pointer select-none hover:bg-slate-50/40 transition-colors">
+    <span class="text-[11px] font-medium text-slate-500 uppercase tracking-wide">مقارنة ملفّين (الفروق)</span>
+    <span id="cmpArrow" class="text-slate-400 text-[10px]">▼</span>
+  </div>
+  <div id="comparePanel" class="hidden p-5 space-y-3">
+    <div class="flex flex-wrap items-center gap-3 text-[12px]">
+      <label class="flex items-center gap-2">
+        <span class="text-[11px] font-medium text-slate-500">ملف A</span>
+        <input type="file" id="cmpA" accept=".plt,.PLT,.hpgl,.HPGL" class="text-[11px]">
+      </label>
+      <label class="flex items-center gap-2">
+        <span class="text-[11px] font-medium text-slate-500">ملف B</span>
+        <input type="file" id="cmpB" accept=".plt,.PLT,.hpgl,.HPGL" class="text-[11px]">
+      </label>
+      <button onclick="doCompare()" class="h-8 px-4 rounded-md text-[12px] font-medium bg-indigo-600 text-white hover:bg-indigo-700 transition-colors">قارن</button>
+    </div>
+    <div id="cmpResult"></div>
+  </div>
+</div>
+
 <!-- ═══════ Canvas Preview ═══════ -->
 <div id="previewSection" class="hidden space-y-4">
 
@@ -1073,6 +1095,43 @@ function fmtHint(){
       :'text-slate-500 bg-slate-50 border-slate-200');
 }
 
+// ── Compare two files ──
+function toggleCompare(){
+  const p=document.getElementById('comparePanel');
+  const a=document.getElementById('cmpArrow');
+  p.classList.toggle('hidden');
+  a.style.transform=p.classList.contains('hidden')?'rotate(0deg)':'rotate(180deg)';
+}
+async function doCompare(){
+  const fa=document.getElementById('cmpA').files[0];
+  const fb=document.getElementById('cmpB').files[0];
+  const res=document.getElementById('cmpResult');
+  if(!fa||!fb){res.innerHTML='<div class="text-[12px] text-red-600">اختر ملفّين أولاً</div>';return}
+  res.innerHTML='<div class="text-[12px] text-slate-500">جاري المقارنة...</div>';
+  const fd=new FormData();fd.append('fileA',fa);fd.append('fileB',fb);
+  try{
+    const r=await fetch('/compare',{method:'POST',body:fd});
+    const d=await r.json();
+    if(d.error){res.innerHTML='<div class="text-[12px] text-red-600">خطأ: '+d.error+'</div>';return}
+    let h='<div class="grid grid-cols-2 gap-3 mb-3 text-[12px]">';
+    h+='<div class="bg-slate-50 rounded-lg p-2.5 border border-slate-100"><div class="font-semibold text-slate-700 truncate">A: '+d.a.name+'</div><div class="text-slate-500">'+d.a.pieces+' قطعة · '+d.a.area+' cm² · '+d.a.notches+' إشارة</div></div>';
+    h+='<div class="bg-slate-50 rounded-lg p-2.5 border border-slate-100"><div class="font-semibold text-slate-700 truncate">B: '+d.b.name+'</div><div class="text-slate-500">'+d.b.pieces+' قطعة · '+d.b.area+' cm² · '+d.b.notches+' إشارة</div></div>';
+    h+='</div>';
+    h+='<table class="w-full text-[12px]"><thead><tr class="text-slate-500 text-[11px] uppercase border-b border-slate-100"><th class="px-2 py-1.5 text-right">القطعة</th><th class="px-2 py-1.5 tabular-nums">A</th><th class="px-2 py-1.5 tabular-nums">B</th><th class="px-2 py-1.5 tabular-nums">الفرق</th></tr></thead><tbody>';
+    for(const row of d.rows){
+      const same=row.diff===0 && JSON.stringify(row.a_areas)===JSON.stringify(row.b_areas);
+      const cls=row.diff!==0?'bg-amber-50':(same?'':'bg-yellow-50/40');
+      const dtxt=row.diff>0?('+'+row.diff):(row.diff<0?row.diff:'=');
+      const dcls=row.diff>0?'text-emerald-700':(row.diff<0?'text-red-600':'text-slate-400');
+      h+='<tr class="'+cls+' border-b border-slate-50"><td class="px-2 py-1.5 text-slate-700 font-medium">'+row.name+'</td><td class="px-2 py-1.5 text-center tabular-nums">'+row.a_count+'</td><td class="px-2 py-1.5 text-center tabular-nums">'+row.b_count+'</td><td class="px-2 py-1.5 text-center font-bold tabular-nums '+dcls+'">'+dtxt+'</td></tr>';
+    }
+    h+='</tbody></table>';
+    const totDiff=d.b.pieces-d.a.pieces;
+    h+='<div class="mt-3 text-[12px] font-medium '+(totDiff===0?'text-emerald-700':'text-amber-700')+'">'+(totDiff===0?'✓ نفس عدد القطع':('فرق العدد الكلّي: '+(totDiff>0?'+':'')+totDiff+' قطعة'))+'</div>';
+    res.innerHTML=h;
+  }catch(e){res.innerHTML='<div class="text-[12px] text-red-600">خطأ: '+e.message+'</div>'}
+}
+
 // ── Meta toggle ──
 function toggleMeta(){
   const p=document.getElementById('metaPanel');
@@ -1155,6 +1214,8 @@ class handler(http.server.BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path).path
         if 'upload-batch' in p:
             self._upload_batch(body, ct)
+        elif 'compare' in p:
+            self._compare(body, ct)
         elif 'convert' in p:
             self._convert(body, ct)
         else:
@@ -1240,6 +1301,63 @@ class handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 results.append({'filename': fn, 'error': str(e)})
         self._json({'files': results, 'count': len(results)})
+
+    def _summary_by_name(self, content):
+        p = HpglParser(content=content)
+        p.parse()
+        if HAS_GROUPER and len(p.pieces) > 1:
+            ensembles = _group_pieces(p)
+        else:
+            ensembles = group_flat_pieces(
+                [{'piece_id': x['piece_id'], 'size': x.get('size', ''),
+                  'polygon': x['polygon']} for x in p.pieces])
+        by = {}
+        for e in ensembles:
+            nm = str(e.get('piece_id', '') or '?')
+            d = by.setdefault(nm, {'count': 0, 'areas': [], 'notches': 0})
+            d['count'] += 1
+            d['areas'].append(round(e['area_mm2'] / 100, 1))
+            d['notches'] += len(e.get('notches', []))
+        return {
+            'pieces': len(ensembles),
+            'by_name': by,
+            'marker': parse_marker_header(content),
+            'total_area': round(sum(e['area_mm2'] for e in ensembles) / 100),
+            'total_notches': sum(len(e.get('notches', [])) for e in ensembles),
+        }
+
+    def _compare(self, body, ct):
+        _, files = self._form(body, ct)
+        if len(files) < 2:
+            return self._json({'error': 'ارفع ملفّين للمقارنة'}, 400)
+        try:
+            ca = files[0][1].decode('latin-1')
+            cb = files[1][1].decode('latin-1')
+            A = self._summary_by_name(ca)
+            B = self._summary_by_name(cb)
+            names = sorted(set(list(A['by_name']) + list(B['by_name'])))
+            rows = []
+            for nm in names:
+                a = A['by_name'].get(nm, {'count': 0, 'areas': [], 'notches': 0})
+                b = B['by_name'].get(nm, {'count': 0, 'areas': [], 'notches': 0})
+                rows.append({
+                    'name': nm,
+                    'a_count': a['count'], 'b_count': b['count'],
+                    'a_areas': sorted(a['areas'], reverse=True),
+                    'b_areas': sorted(b['areas'], reverse=True),
+                    'diff': b['count'] - a['count'],
+                })
+            self._json({
+                'a': {'name': files[0][2], 'pieces': A['pieces'],
+                      'area': A['total_area'], 'notches': A['total_notches'],
+                      'marker': A['marker']},
+                'b': {'name': files[1][2], 'pieces': B['pieces'],
+                      'area': B['total_area'], 'notches': B['total_notches'],
+                      'marker': B['marker']},
+                'rows': rows,
+            })
+        except Exception as e:
+            self._json({'error': f'{e}'}, 500)
 
     def _convert(self, body, ct):
         fields, files = self._form(body, ct)
