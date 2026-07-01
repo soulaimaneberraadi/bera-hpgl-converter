@@ -1,5 +1,5 @@
 """BERA Converter - single-file Vercel serverless function (self-contained)."""
-import http.server, urllib.parse, os, io, json, re, math, struct
+import http.server, urllib.parse, os, io, json, re, math, struct, zipfile
 from http.server import BaseHTTPRequestHandler
 from typing import List, Tuple, Dict, Optional
 from collections import defaultdict
@@ -569,6 +569,21 @@ are emitted nested in one ASTM block so Gerber reads the piece as graded.
 """
 
 
+_SIZE_ORDER = ['XXXS', 'XXS', 'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL', 'XXXXL']
+
+
+def size_sort_key(s):
+    """Sort garment sizes correctly: letter sizes (XS..XXXXL) by their natural
+    order, numeric sizes (34, 36, 42...) numerically, anything else falls back
+    to plain string order."""
+    su = str(s).upper()
+    if su in _SIZE_ORDER:
+        return (0, _SIZE_ORDER.index(su), '')
+    try:
+        return (1, float(su), '')
+    except ValueError:
+        return (2, 0.0, su)
+
 
 def resample(poly, n=96):
     """Resample a closed polygon to n points equally spaced by arc length."""
@@ -664,7 +679,7 @@ def build_graded_pieces(ensembles, n=96):
 
     graded = []
     for nm, bysz in byname.items():
-        sizes = sorted(bysz.keys())
+        sizes = sorted(bysz.keys(), key=size_sort_key)
         if len(sizes) < 2:
             for e in bysz[sizes[0]]:
                 singles.append(e)
@@ -692,6 +707,87 @@ def build_graded_pieces(ensembles, n=96):
         })
     return graded, singles
 
+
+def build_astm_grade_data(ensembles, n=64):
+    """Build genuine ANSI/AAMA grade-rule data: one BASE-SIZE boundary per
+    piece plus a GLOBAL sequential rule table (rule N -> {size: (dx, dy)}).
+
+    This mirrors the real structure found in a Gerber/Lectra-exported
+    DXF+.RUL pair (reverse-engineered from a genuine sample): each boundary
+    vertex gets a POINT + TEXT '# N' marker on layer 2, numbered sequentially
+    across ALL pieces in file order; 'RULE: DELTA N' in the companion .RUL
+    table holds that point's (dx, dy) offset from the base size, per size.
+    Notches reuse their nearest boundary point's rule (they were found
+    coincident with a boundary vertex in the reference sample).
+
+    Returns (pieces, rules, singles):
+      pieces: [{'name','sizes','base_size','boundary','point_rules',
+                'notches','notch_rules','internals'}, ...]
+      rules:  {rule_num: {size: (dx, dy)}}   (mils, same unit as input)
+      singles: ensembles that couldn't be graded (only one size present)
+    """
+    byname = defaultdict(lambda: defaultdict(list))
+    singles = []
+    for e in ensembles:
+        nm = str(e.get('piece_id', '') or '')
+        sz = str(e.get('size', '') or '')
+        if nm and sz:
+            byname[nm][sz].append(e)
+        else:
+            singles.append(e)
+
+    pieces = []
+    rules = {}
+    next_rule = 1
+
+    for nm, bysz in byname.items():
+        sizes = sorted(bysz.keys(), key=size_sort_key)
+        if len(sizes) < 2:
+            for e in bysz[sizes[0]]:
+                singles.append(e)
+            continue
+        reps = {sz: max(lst, key=lambda e: area(e['outer']))
+                for sz, lst in bysz.items()}
+        base_sz = sizes[0]
+        base = reps[base_sz]
+        npts = n if len(base['outer']) > n else max(12, len(base['outer']))
+        boundary = resample(base['outer'], npts)
+        aligned = {base_sz: boundary}
+        for sz in sizes[1:]:
+            al, _resid = align_to(reps[sz]['outer'], base['outer'], npts)
+            aligned[sz] = al
+
+        point_rules = []
+        for i in range(len(boundary)):
+            rid = next_rule
+            next_rule += 1
+            bx, by = boundary[i]
+            rules[rid] = {base_sz: (0.0, 0.0)}
+            for sz in sizes[1:]:
+                ax, ay = aligned[sz][i]
+                rules[rid][sz] = (ax - bx, ay - by)
+            point_rules.append(rid)
+
+        notch_rules = []
+        for nx, ny in base.get('notches', []):
+            j = min(range(len(boundary)),
+                    key=lambda k: math.hypot(boundary[k][0] - nx,
+                                             boundary[k][1] - ny))
+            notch_rules.append(point_rules[j])
+
+        pieces.append({
+            'name': nm,
+            'sizes': sizes,
+            'base_size': base_sz,
+            'boundary': boundary,
+            'point_rules': point_rules,
+            'notches': base.get('notches', []),
+            'notch_rules': notch_rules,
+            'internals': base.get('internals', []),
+        })
+
+    return pieces, rules, singles
+
 # ---- module aliases expected by the web layer ----
 _group_pieces = group_pieces
 _poly_area = area
@@ -707,7 +803,7 @@ HAS_GRADATION = True
 
 
 
-PORT = 9000
+PORT = int(os.environ.get('PORT', 9000))
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -1204,6 +1300,124 @@ def export_dxf_aama_graded(graded, singles, unit='mm', model=''):
         L.append(f'0\nINSERT\n8\n0\n2\n{bname}\n10\n0.0\n20\n0.0\n30\n0.0')
     L.append('0\nENDSEC\n0\nEOF')
     return '\n'.join(L)
+
+
+def _rul_pair(dx, dy):
+    """Format one (dx, dy) grade delta exactly like a genuine Lectra/AAMA
+    .RUL file: right-justified 10-char X field, comma, right-justified 9-char
+    Y field, no separator before the next pair (reverse-engineered byte-for-
+    byte from a real Gerber/Lectra export)."""
+    return f'{dx:>10.2f},{dy:>9.2f}'
+
+
+def build_rul_text(rules, sizes, base_size, table_name='BERA_GRADE',
+                   author='BERA Converter', units='METRIC'):
+    """Emit an ANSI/AAMA grade-rule table (.RUL) — plain text, industry
+    standard, matching exactly what Gerber AccuMark / Lectra export and
+    import natively."""
+    import datetime
+    now = datetime.datetime.now()
+    lines = [
+        'ANSI/AAMA VERSION: 1.0.0',
+        f'AUTHOR: {author}',
+        f'CREATION DATE: {now.day}-{now.month}-{now.year}',
+        f'CREATION TIME: {now.hour}:{now.minute:02d}',
+        f'UNITS: {units}',
+        f'GRADE RULE TABLE: {table_name}',
+        f'NUMBER OF SIZES: {len(sizes):>2d}',
+        'SIZE LIST: ' + ' '.join(sizes) + ' ',
+        f'SAMPLE SIZE: {base_size}',
+    ]
+    for rid in sorted(rules):
+        lines.append(f'RULE: DELTA {rid:>2d}')
+        pairs = [_rul_pair(*rules[rid].get(sz, (0.0, 0.0))) for sz in sizes]
+        for i in range(0, len(pairs), 4):
+            lines.append(''.join(pairs[i:i + 4]))
+    return '\r\n'.join(lines) + '\r\n'
+
+
+def export_astm_dxf_and_rul(pieces, rules, unit='mm', model=''):
+    """Emit a genuine graded ASTM/AAMA DXF + companion .RUL grade-rule table,
+    matching the real Gerber/Lectra export structure byte-for-byte in intent:
+    each piece is ONE base-size boundary (layer 1) with numbered grade points
+    ('# N' TEXT + POINT on layer 2) referencing 'RULE: DELTA N' in the .RUL
+    file. Gerber's own Gradation tools read this natively — no guessed nested
+    outlines. Returns (dxf_text, rul_text)."""
+    scale = _unit_scale(unit)
+    text_h = {'mm': 4.0, 'cm': 0.4, 'inch': 0.16}.get(unit, 4.0)
+    insunits = {'mm': '4', 'cm': '5', 'inch': '1'}.get(unit, '4')
+    category = re.sub(r'[^A-Za-z0-9 _.\-]', '', str(model)).strip()[:40]
+    layers = [('0', 7), ('1', 7), ('2', 1), ('4', 3), ('7', 5), ('8', 3),
+              ('11', 4), ('13', 6), ('15', 2)]
+
+    L = ['0\nSECTION\n2\nHEADER', '9\n$ACADVER\n1\nAC1009',
+         f'9\n$INSUNITS\n70\n{insunits}', '9\n$MEASUREMENT\n70\n1',
+         '0\nENDSEC']
+    L.append('0\nSECTION\n2\nTABLES')
+    L.append('0\nTABLE\n2\nAPPID\n70\n1\n0\nAPPID\n2\nASTM_DXF\n70\n0\n0\nENDTAB')
+    L.append(f'0\nTABLE\n2\nLAYER\n70\n{len(layers)}')
+    for name, col in layers:
+        L.append(f'0\nLAYER\n2\n{name}\n70\n0\n62\n{col}\n6\nCONTINUOUS')
+    L.append('0\nENDTAB\n0\nENDSEC')
+
+    blocks = []
+    used = set()
+    L.append('0\nSECTION\n2\nBLOCKS')
+    for pc in pieces:
+        bname = _sanitize_name(pc['name'], used)
+        blocks.append(bname)
+        L.append(f'0\nBLOCK\n8\n0\n2\n{bname}\n70\n0'
+                 f'\n10\n0.0\n20\n0.0\n30\n0.0\n3\n{bname}')
+
+        boundary = pc['boundary']
+        pts = [(x * scale, y * scale) for x, y in boundary]
+        poly = _aama_polyline('1', pts, True)
+        xd = f'\n1001\nASTM_DXF\n1000\nPIECE NAME;{bname}'
+        if category:
+            xd += f'\n1000\nPIECE CATEGORY;{category}'
+        xd += (f'\n1000\nSIZE;{pc["base_size"]}\n1000\nGRADED;'
+               + ','.join(pc['sizes']) + '\n1000\nQUANTITY;1\n1070\n1')
+        poly[0] += xd
+        L.extend(poly)
+
+        for (x, y), rid in zip(boundary, pc['point_rules']):
+            px, py = x * scale, y * scale
+            L.append(f'0\nPOINT\n8\n2\n10\n{px:.4f}\n20\n{py:.4f}\n30\n0.0')
+            L.append(f'0\nTEXT\n8\n2\n10\n{px:.4f}\n20\n{py:.4f}'
+                     f'\n40\n{text_h:.4f}\n1\n# {rid}')
+
+        for i, (nx, ny) in enumerate(pc.get('notches', [])):
+            px, py = nx * scale, ny * scale
+            L.append(f'0\nPOINT\n8\n4\n10\n{px:.4f}\n20\n{py:.4f}'
+                     f'\n30\n4.0\n39\n6.0\n50\n0.0')
+            if i < len(pc.get('notch_rules', [])):
+                rid = pc['notch_rules'][i]
+                L.append(f'0\nTEXT\n8\n2\n10\n{px:.4f}\n20\n{py:.4f}'
+                         f'\n40\n{text_h:.4f}\n1\n# {rid}')
+
+        cx = sum(p[0] for p in boundary) / len(boundary) * scale
+        cy = sum(p[1] for p in boundary) / len(boundary) * scale
+        L.append(f'0\nTEXT\n8\n15\n10\n{cx:.4f}\n20\n{cy:.4f}'
+                 f'\n40\n{5*scale:.4f}\n1\n{bname}')
+        L.append('0\nENDBLK\n8\n0')
+    L.append('0\nENDSEC')
+
+    L.append('0\nSECTION\n2\nENTITIES')
+    for bname in blocks:
+        L.append(f'0\nINSERT\n8\n0\n2\n{bname}\n10\n0.0\n20\n0.0\n30\n0.0')
+    L.append('0\nENDSEC\n0\nEOF')
+    dxf_text = '\n'.join(L)
+
+    all_sizes = sorted({s for pc in pieces for s in pc['sizes']}, key=size_sort_key)
+    base_size = pieces[0]['base_size'] if pieces else ''
+    to_out = 1.0 if unit == 'mils' else _unit_scale(unit)
+    scaled_rules = {rid: {sz: (dx * to_out, dy * to_out) for sz, (dx, dy) in d.items()}
+                    for rid, d in rules.items()}
+    units_word = 'ENGLISH' if unit == 'inch' else 'METRIC'
+    rul_text = build_rul_text(scaled_rules, all_sizes, base_size,
+                              table_name=re.sub(r'[^A-Za-z0-9_]', '_', category or 'MODEL')[:40] or 'MODEL',
+                              units=units_word)
+    return dxf_text, rul_text
 
 
 def export_csv_report(ensembles, marker, unit='mm'):
@@ -1752,8 +1966,9 @@ async function doConvert(){
     if(!r.ok){const e=await r.json();setStatus('err','خطأ: '+(e.error||''));btn.disabled=false;return}
     const blob=await r.blob();
     const url=URL.createObjectURL(blob);
-    const ext=fmtExt(document.getElementById('fmt').value);
-    const szTag=(szf&&szf!=='all')?(' '+szf):'';
+    const isZip=blob.type==='application/zip';
+    const ext=isZip?'zip':fmtExt(document.getElementById('fmt').value);
+    const szTag=(szf&&szf!=='all'&&!isZip)?(' '+szf):(isZip?' GRADED':'');
     const fn=currentFile.name.replace(/\.(plt|hpgl)$/i,'')+szTag+'.'+ext;
     const dl=document.getElementById('dlArea');
     dl.innerHTML='<a class="inline-flex h-8 px-3 rounded-md text-[12px] font-medium bg-emerald-600 text-white hover:bg-emerald-700 transition-colors items-center gap-1.5" href="'+url+'" download="'+fn+'">'+fn+'</a>';
@@ -2112,6 +2327,25 @@ class handler(BaseHTTPRequestHandler):
                 base_size = mk.get('size', '') if mk else ''
                 grade = fields.get('grade', '0') == '1'
                 if grade and HAS_GRADATION:
+                    astm_pieces, astm_rules, astm_singles = build_astm_grade_data(ensembles)
+                    if astm_pieces:
+                        dxf_text, rul_text = export_astm_dxf_and_rul(
+                            astm_pieces, astm_rules, unit, model)
+                        base_name = re.sub(r'[^A-Za-z0-9 _.\-]', '', model or 'MODEL').strip() or 'MODEL'
+                        buf = io.BytesIO()
+                        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                            zf.writestr(f'{base_name}.DXF', dxf_text)
+                            zf.writestr(f'{base_name}.RUL', rul_text)
+                        self.send_response(200)
+                        self._cors()
+                        self.send_header('Content-Type', 'application/zip')
+                        self.send_header(
+                            'Content-Disposition',
+                            f'attachment; filename="{base_name} GRADED.zip"')
+                        self.send_header('Content-Length', str(buf.tell()))
+                        self.end_headers()
+                        self.wfile.write(buf.getvalue())
+                        return
                     graded, singles = build_graded_pieces(ensembles)
                     out = export_dxf_aama_graded(graded, singles, unit, model)
                 else:
