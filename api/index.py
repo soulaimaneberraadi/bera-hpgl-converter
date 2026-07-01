@@ -1658,14 +1658,14 @@ input,select,button,textarea{font-family:inherit}
         <label class="flex items-center gap-2 text-[12px] text-slate-600">
           <span class="text-[11px] font-medium text-slate-500">الصيغة</span>
           <select id="fmt" onchange="fmtHint()" class="h-8 px-2 rounded-md border border-slate-200 bg-white text-[12px] text-slate-700 focus:ring-2 focus:ring-emerald-100 focus:border-emerald-300">
-            <option>AAMA DXF</option><option>DXF</option><option>SVG</option><option>PLT</option><option value="CSV">CSV تقرير</option>
+            <option>AAMA DXF</option><option value="ZIP">ZIP (قطع + قاعدة تدرّج)</option><option>DXF</option><option>SVG</option><option>PLT</option><option value="CSV">CSV تقرير</option>
           </select>
         </label>
         <span id="fmtHintBox" class="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200/70 rounded-full px-2.5 py-1"></span>
         <label class="flex items-center gap-2 text-[12px] text-slate-600">
           <span class="text-[11px] font-medium text-slate-500">الوحدة</span>
           <select id="unit" class="h-8 px-2 rounded-md border border-slate-200 bg-white text-[12px] text-slate-700 focus:ring-2 focus:ring-slate-100 focus:border-slate-300">
-            <option>mm</option><option>cm</option><option>inch</option>
+            <option>cm</option><option>mm</option><option>inch</option>
           </select>
         </label>
         <label class="flex items-center gap-2 text-[12px] text-slate-600">
@@ -1960,7 +1960,8 @@ async function doConvert(){
   fd.append('include_labels',document.getElementById('incLabels').checked?'1':'0');
   const szf=document.getElementById('sizeFilter').value;
   fd.append('size',szf);
-  fd.append('grade',document.getElementById('gradeMerge').checked?'1':'0');
+  const isZipFmt=document.getElementById('fmt').value==='ZIP';
+  fd.append('grade',(isZipFmt||document.getElementById('gradeMerge').checked)?'1':'0');
   try{
     const r=await fetch('/convert',{method:'POST',body:fd});
     if(!r.ok){const e=await r.json();setStatus('err','خطأ: '+(e.error||''));btn.disabled=false;return}
@@ -1979,12 +1980,13 @@ async function doConvert(){
 
 // ── Format → file extension (AAMA/DXF both export .dxf so Gerber sees them) ──
 function fmtExt(v){
-  return ({'AAMA DXF':'dxf','DXF':'dxf','SVG':'svg','PLT':'plt','CSV':'csv'})[v]||'dxf';
+  return ({'AAMA DXF':'dxf','ZIP':'zip','DXF':'dxf','SVG':'svg','PLT':'plt','CSV':'csv'})[v]||'dxf';
 }
 
 // ── Format hint ──
 const FMT_HINTS={
   'AAMA DXF':['✓ موصى به لـ Gerber AccuMark / PDS · Lectra · Optitex','emerald'],
+  'ZIP':['✓ موديل متدرّج كامل: MODEL.DXF + MODEL.RUL (قواعد ANSI/AAMA) — يُستورد في Gerber عبر "ZIP files"','emerald'],
   'DXF':['DXF عام — للعرض في AutoCAD','slate'],
   'SVG':['SVG — للعرض في المتصفح والطباعة','slate'],
   'PLT':['PLT — إعادة إخراج HPGL للراسمة','slate'],
@@ -2314,7 +2316,7 @@ class handler(BaseHTTPRequestHandler):
             elif fmt == 'plt':
                 out = export_plt(p, unit, outer, inc_notches, inc_labels)
                 cty = 'application/octet-stream'
-            elif fmt in ('aama', 'aama-dxf', 'aamadxf'):
+            elif fmt in ('aama', 'aama-dxf', 'aamadxf', 'zip'):
                 if HAS_GROUPER and len(p.pieces) > 1:
                     ensembles = _group_pieces(p)
                 else:
@@ -2325,7 +2327,7 @@ class handler(BaseHTTPRequestHandler):
                 mk = parse_marker_header(content)
                 model = (mk.get('modele') or mk.get('placement')) if mk else ''
                 base_size = mk.get('size', '') if mk else ''
-                grade = fields.get('grade', '0') == '1'
+                grade = fmt == 'zip' or fields.get('grade', '0') == '1'
                 if grade and HAS_GRADATION:
                     astm_pieces, astm_rules, astm_singles = build_astm_grade_data(ensembles)
                     if astm_pieces:
@@ -2369,7 +2371,7 @@ class handler(BaseHTTPRequestHandler):
             else:
                 return self._json({'error': f'صيغة غير مدعومة: {fmt}'}, 400)
             is_csv = fmt in ('csv', 'report', 'table', 'csv-تقرير', 'تقرير')
-            ext = ('dxf' if fmt in ('aama', 'aama-dxf', 'aamadxf')
+            ext = ('dxf' if fmt in ('aama', 'aama-dxf', 'aamadxf', 'zip')
                    else 'csv' if is_csv else fmt)
             b = out.encode('utf-8-sig') if is_csv \
                 else out.encode('ascii', errors='replace')
