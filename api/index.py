@@ -10,6 +10,12 @@ try:
 except ImportError:
     HAS_GROUPER = False
 
+try:
+    from gradation import build_graded_pieces
+    HAS_GRADATION = True
+except ImportError:
+    HAS_GRADATION = False
+
 PORT = 9000
 
 
@@ -441,6 +447,74 @@ def export_dxf_aama(ensembles, unit='mm', model='', base_size=''):
     return '\n'.join(L)
 
 
+def export_dxf_aama_graded(graded, singles, unit='mm', model=''):
+    """Graded ASTM D6673 DXF. Each piece is ONE block holding its boundary at
+    every size (nested, aligned to a common grade-reference point), so Gerber
+    imports it as a gradable piece — one piece carrying all its sizes."""
+    scale = _unit_scale(unit)
+    insunits = {'mm': '4', 'cm': '5', 'inch': '1'}.get(unit, '4')
+    category = re.sub(r'[^A-Za-z0-9 _.\-]', '', str(model)).strip()[:40]
+    layers = [('0', 7), ('1', 7), ('4', 1), ('5', 6), ('7', 5),
+              ('8', 3), ('11', 4), ('13', 6), ('15', 2)]
+
+    L = ['0\nSECTION\n2\nHEADER', '9\n$ACADVER\n1\nAC1009',
+         f'9\n$INSUNITS\n70\n{insunits}', '9\n$MEASUREMENT\n70\n1', '0\nENDSEC']
+    L.append('0\nSECTION\n2\nTABLES')
+    L.append('0\nTABLE\n2\nAPPID\n70\n1\n0\nAPPID\n2\nASTM_DXF\n70\n0\n0\nENDTAB')
+    L.append(f'0\nTABLE\n2\nLAYER\n70\n{len(layers)}')
+    for name, col in layers:
+        L.append(f'0\nLAYER\n2\n{name}\n70\n0\n62\n{col}\n6\nCONTINUOUS')
+    L.append('0\nENDTAB\n0\nENDSEC')
+
+    blocks = []
+    used = set()
+    L.append('0\nSECTION\n2\nBLOCKS')
+
+    def emit(bname, size_boundaries, base_size, notches):
+        L.append(f'0\nBLOCK\n8\n0\n2\n{bname}\n70\n0'
+                 f'\n10\n0.0\n20\n0.0\n30\n0.0\n3\n{bname}')
+        base = size_boundaries[base_size]
+        cx = sum(p[0] for p in base) / len(base) * scale
+        cy = sum(p[1] for p in base) / len(base) * scale
+        # grade reference point (layer 5)
+        L.append(f'0\nPOINT\n8\n5\n10\n{cx:.4f}\n20\n{cy:.4f}\n30\n0.0')
+        for sz in sorted(size_boundaries):
+            pts = [(x * scale, y * scale) for x, y in size_boundaries[sz]]
+            poly = _aama_polyline('1', pts, True)
+            xd = f'\n1001\nASTM_DXF\n1000\nPIECE NAME;{bname}'
+            if category:
+                xd += f'\n1000\nPIECE CATEGORY;{category}'
+            xd += f'\n1000\nSIZE;{sz}'
+            if sz == base_size:
+                xd += '\n1000\nBASE SIZE;1'
+            xd += '\n1000\nQUANTITY;1\n1070\n1'
+            poly[0] += xd
+            L.extend(poly)
+        for nx, ny in notches:
+            L.append(f'0\nPOINT\n8\n4\n10\n{nx*scale:.4f}'
+                     f'\n20\n{ny*scale:.4f}\n30\n0.0')
+        L.append(f'0\nTEXT\n8\n15\n10\n{cx:.4f}\n20\n{cy:.4f}'
+                 f'\n40\n{5*scale:.4f}\n1\n{bname}')
+        L.append('0\nENDBLK\n8\n0')
+
+    for g in graded:
+        bname = _sanitize_name(g['name'], used)
+        blocks.append(bname)
+        emit(bname, g['boundaries'], g['base_size'], g.get('notches', []))
+    for e in singles:
+        bname = _sanitize_name(str(e.get('piece_id', '') or 'PIECE'), used)
+        blocks.append(bname)
+        sz = str(e.get('size', '') or '0')
+        emit(bname, {sz: e['outer']}, sz, e.get('notches', []))
+
+    L.append('0\nENDSEC')
+    L.append('0\nSECTION\n2\nENTITIES')
+    for bname in blocks:
+        L.append(f'0\nINSERT\n8\n0\n2\n{bname}\n10\n0.0\n20\n0.0\n30\n0.0')
+    L.append('0\nENDSEC\n0\nEOF')
+    return '\n'.join(L)
+
+
 def export_csv_report(ensembles, marker, unit='mm'):
     """Reverse-engineering report (CSV): marker header + piece table + notch
     table. UTF-8 with BOM so Excel opens Arabic/accents correctly."""
@@ -684,6 +758,10 @@ input,select,button,textarea{font-family:inherit}
         <label class="flex items-center gap-1.5 text-[12px] text-slate-600 cursor-pointer">
           <input type="checkbox" id="incLabels" checked class="rounded border-slate-300">
           <span class="text-[11px] font-medium text-slate-500">include labels</span>
+        </label>
+        <label class="flex items-center gap-1.5 text-[12px] cursor-pointer" title="دمج مقاسات كل قطعة في قطعة واحدة متدرّجة (AAMA)">
+          <input type="checkbox" id="gradeMerge" class="rounded border-emerald-400">
+          <span class="text-[11px] font-bold text-emerald-700">تدرّج (دمج المقاسات)</span>
         </label>
         <button id="convertBtn" onclick="doConvert()"
                 class="mr-auto h-9 px-5 rounded-lg text-[12.5px] font-bold text-white bg-gradient-to-l from-emerald-600 to-indigo-600 hover:from-emerald-500 hover:to-indigo-500 shadow-sm shadow-emerald-600/20 transition-all active:scale-[.98] disabled:opacity-40 inline-flex items-center gap-2">
@@ -955,6 +1033,7 @@ async function doConvert(){
   fd.append('include_labels',document.getElementById('incLabels').checked?'1':'0');
   const szf=document.getElementById('sizeFilter').value;
   fd.append('size',szf);
+  fd.append('grade',document.getElementById('gradeMerge').checked?'1':'0');
   try{
     const r=await fetch('/convert',{method:'POST',body:fd});
     if(!r.ok){const e=await r.json();setStatus('err','خطأ: '+(e.error||''));btn.disabled=false;return}
@@ -1056,7 +1135,6 @@ def parse_multipart(body, boundary):
 class handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
-        # Single-page app: any GET serves the UI (Vercel rewrites all here)
         b = TEMPLATE.encode('utf-8')
         self.send_response(200)
         self._cors()
@@ -1074,7 +1152,6 @@ class handler(http.server.BaseHTTPRequestHandler):
         ct = self.headers.get('Content-Type', '')
         cl = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(cl)
-        # substring routing so it works both locally and behind Vercel rewrites
         p = urllib.parse.urlparse(self.path).path
         if 'upload-batch' in p:
             self._upload_batch(body, ct)
@@ -1202,14 +1279,19 @@ class handler(http.server.BaseHTTPRequestHandler):
                         [{'piece_id': x['piece_id'], 'size': x.get('size', ''),
                           'polygon': x['polygon']} for x in p.pieces]
                     )
-                ensembles = _size_filter(ensembles)
-                if outer:
-                    for e in ensembles:
-                        e['internals'] = []
                 mk = parse_marker_header(content)
                 model = (mk.get('modele') or mk.get('placement')) if mk else ''
                 base_size = mk.get('size', '') if mk else ''
-                out = export_dxf_aama(ensembles, unit, model, base_size)
+                grade = fields.get('grade', '0') == '1'
+                if grade and HAS_GRADATION:
+                    graded, singles = build_graded_pieces(ensembles)
+                    out = export_dxf_aama_graded(graded, singles, unit, model)
+                else:
+                    ensembles = _size_filter(ensembles)
+                    if outer:
+                        for e in ensembles:
+                            e['internals'] = []
+                    out = export_dxf_aama(ensembles, unit, model, base_size)
                 cty = 'application/dxf'
             elif fmt in ('csv', 'report', 'table', 'csv-تقرير', 'تقرير'):
                 if HAS_GROUPER and len(p.pieces) > 1:
