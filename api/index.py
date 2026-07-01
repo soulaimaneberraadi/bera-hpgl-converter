@@ -1,3 +1,5 @@
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 """BERA Converter Web — BERAMETHODE style — Full feature"""
 
 import http.server, urllib.parse, os, io, json, re, math, struct
